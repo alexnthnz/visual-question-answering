@@ -1,0 +1,7 @@
+torch
+transformers
+pillow
+datasets
+matplotlib
+tqdm
+torchmetrics
