@@ -14,7 +14,8 @@ class VQAModel(nn.Module):
         model_name: str = "openai/clip-vit-base-patch32",
         num_answers: int = 3000,
         hidden_dim: int = 512,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        unfreeze_clip: bool = False
     ) -> None:
         super().__init__()
         
@@ -40,9 +41,9 @@ class VQAModel(nn.Module):
         self.answer_vocab: Optional[Dict[str, int]] = None
         self.idx_to_answer: Optional[Dict[int, str]] = None
         
-        # Freeze CLIP parameters initially
+        # Handle CLIP freezing
         for param in self.clip_model.parameters():
-            param.requires_grad = False
+            param.requires_grad = unfreeze_clip
     
     def build_answer_vocab(self, dataset) -> Dict[str, int]:
         """Build answer vocabulary from dataset."""

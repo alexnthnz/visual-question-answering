@@ -60,7 +60,9 @@ python -m vqa.train \
   --epochs 10 \
   --batch-size 64 \
   --learning-rate 5e-5 \
-  --data-fraction 1.0
+  --data-fraction 1.0 \
+  --unfreeze-clip \
+  --gradient-accumulation-steps 4
 ```
 
 ### Evaluation
@@ -68,7 +70,7 @@ python -m vqa.train \
 Evaluate model performance:
 ```bash
 # Evaluate with saved model
-python -m vqa.evaluate --model-path models/vqa_model_final.pt
+python -m vqa.evaluate --model-path models/vqa_model_final.pt --batch-size 64 --data-fraction 0.2
 
 # Quick evaluation on small subset
 python -m vqa.evaluate --data-fraction 0.1
@@ -127,7 +129,8 @@ model_config = ModelConfig(
     model_name="openai/clip-vit-large-patch14",
     num_answers=5000,
     hidden_dim=1024,
-    dropout=0.2
+    dropout=0.2,
+    unfreeze_clip=True
 )
 
 # Customize training parameters
@@ -135,7 +138,8 @@ train_config = TrainingConfig(
     epochs=20,
     batch_size=128,
     learning_rate=1e-4,
-    data_fraction=1.0
+    data_fraction=1.0,
+    gradient_accumulation_steps=2
 )
 ```
 
@@ -264,10 +268,17 @@ VQA datasets can contain societal biases including:
 
 ### Performance Optimization
 
-- Use `accelerate` for multi-GPU training
-- Enable mixed precision training
-- Use gradient accumulation for larger effective batch sizes
-- Consider model distillation for faster inference
+- Use `accelerate` for multi-GPU training and mixed precision (now enabled by default)
+- Enable gradient accumulation with --gradient-accumulation-steps
+- Unfreeze CLIP backbone with --unfreeze-clip for fine-tuning
+
+## 🧪 Testing
+
+Run unit tests with pytest:
+
+```bash
+pytest tests/
+```
 
 ## 📚 Contributing
 
