@@ -13,6 +13,7 @@ from accelerate import Accelerator
 
 from .model import VQAModel
 from .data import _DATA_DIR
+from .config import ModelConfig, TrainingConfig
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -55,52 +56,58 @@ def collate_fn(batch, model: VQAModel):
 
 
 def train(
-    epochs: int = 5,
-    batch_size: int = 32,
-    learning_rate: float = 1e-4,
-    data_fraction: float = 0.1,
-    save_path: Optional[str] = None,
-    vocab_path: Optional[str] = None
+    model_config: ModelConfig = ModelConfig(),
+    train_config: TrainingConfig = TrainingConfig()
 ) -> VQAModel:
-    """Train the VQA model with proper supervision."""
+    logger.info(f"Model Config: {model_config}")
+    logger.info(f"Training Config: {train_config}")
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
     
     # Initialize accelerator for distributed training
     accelerator = Accelerator()
     device = accelerator.device
     
     logger.info(f"Training on device: {device}")
-    logger.info(f"Using data fraction: {data_fraction}")
+    logger.info(f"Using data fraction: {train_config.data_fraction}")
     
     # Load dataset
     logger.info("Loading dataset...")
-    train_split = f"train[:{int(data_fraction * 100)}%]"
+    train_split = f"train[:{int(train_config.data_fraction * 100)}%]"
     dataset = load_dataset("vqa", "vqa_v2", data_dir=str(_DATA_DIR), split=train_split)
     
-    # Initialize model
+    # Initialize model with config
     logger.info("Initializing model...")
-    model = VQAModel()
+    model = VQAModel(
+        model_name=model_config.model_name,
+        num_answers=model_config.num_answers,
+        hidden_dim=model_config.hidden_dim,
+        dropout=model_config.dropout,
+        unfreeze_clip=model_config.unfreeze_clip
+    )
     
     # Build answer vocabulary
     logger.info("Building answer vocabulary...")
     model.build_answer_vocab(dataset)
     
     # Save vocabulary if path provided
-    if vocab_path:
-        model.save_answer_vocab(vocab_path)
-        logger.info(f"Saved vocabulary to {vocab_path}")
+    if train_config.vocab_path:
+        model.save_answer_vocab(train_config.vocab_path)
+        logger.info(f"Saved vocabulary to {train_config.vocab_path}")
     
     # Create dataset and dataloader
     vqa_dataset = VQADataset(dataset, model)
     dataloader = DataLoader(
         vqa_dataset,
-        batch_size=batch_size,
+        batch_size=train_config.batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, model),
         num_workers=0  # Set to 0 for compatibility
     )
     
     # Initialize optimizer and loss
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
     criterion = nn.BCEWithLogitsLoss()  # For soft targets
     
     # Prepare for accelerated training
@@ -108,50 +115,59 @@ def train(
     
     # Training loop
     model.train()
-    total_steps = len(dataloader) * epochs
+    total_steps = len(dataloader) * train_config.epochs
     progress_bar = tqdm(total=total_steps, desc="Training")
     
-    for epoch in range(epochs):
+    for epoch in range(train_config.epochs):
         epoch_loss = 0.0
         num_batches = 0
+        accumulated_loss = 0.0
         
-        for batch in dataloader:
-            # Forward pass
-            logits = model(batch['images'], batch['questions'])
-            targets = batch['targets'].to(device)
+        for step, batch in enumerate(dataloader):
+            with accelerator.autocast():
+                logits = model(batch['images'], batch['questions'])
+                targets = batch['targets'].to(device)
+                
+                loss = criterion(logits, targets) / train_config.gradient_accumulation_steps
+                accumulated_loss += loss.item()
             
-            # Compute loss
-            loss = criterion(logits, targets)
-            
-            # Backward pass
             accelerator.backward(loss)
+            
+            if (step + 1) % train_config.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                # Log accumulated loss
+                progress_bar.update(train_config.gradient_accumulation_steps)
+                progress_bar.set_postfix({
+                    'epoch': epoch + 1,
+                    'loss': f"{accumulated_loss:.4f}",
+                    'avg_loss': f"{epoch_loss / (num_batches + 1):.4f}"
+                })
+                epoch_loss += accumulated_loss
+                accumulated_loss = 0.0
+                num_batches += 1
+        
+        # Handle any remaining accumulation
+        if accumulated_loss > 0:
             optimizer.step()
             optimizer.zero_grad()
-            
-            # Update progress
-            epoch_loss += loss.item()
+            epoch_loss += accumulated_loss
             num_batches += 1
-            progress_bar.update(1)
-            progress_bar.set_postfix({
-                'epoch': epoch + 1,
-                'loss': f"{loss.item():.4f}",
-                'avg_loss': f"{epoch_loss / num_batches:.4f}"
-            })
         
-        avg_epoch_loss = epoch_loss / num_batches
-        logger.info(f"Epoch {epoch + 1}/{epochs} - Average Loss: {avg_epoch_loss:.4f}")
+        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        logger.info(f"Epoch {epoch + 1}/{train_config.epochs} - Average Loss: {avg_epoch_loss:.4f}")
         
         # Save checkpoint
-        if save_path and (epoch + 1) % 2 == 0:  # Save every 2 epochs
-            checkpoint_path = f"{save_path}_epoch_{epoch + 1}.pt"
+        if train_config.save_path and (epoch + 1) % train_config.save_every_n_epochs == 0:
+            checkpoint_path = f"{train_config.save_path}_epoch_{epoch + 1}.pt"
             accelerator.save(model.state_dict(), checkpoint_path)
             logger.info(f"Saved checkpoint to {checkpoint_path}")
     
     progress_bar.close()
     
     # Save final model
-    if save_path:
-        final_path = f"{save_path}_final.pt"
+    if train_config.save_path:
+        final_path = f"{train_config.save_path}_final.pt"
         accelerator.save(model.state_dict(), final_path)
         logger.info(f"Saved final model to {final_path}")
     
@@ -166,20 +182,45 @@ def main():
     parser.add_argument("--data-fraction", type=float, default=0.1, help="Fraction of dataset to use")
     parser.add_argument("--save-path", type=str, default="models/vqa_model", help="Path to save model")
     parser.add_argument("--vocab-path", type=str, default="models/answer_vocab.json", help="Path to save vocabulary")
+    parser.add_argument("--model-name", type=str, default="openai/clip-vit-base-patch32", help="CLIP model name")
+    parser.add_argument("--num-answers", type=int, default=3000, help="Number of answers in vocabulary")
+    parser.add_argument("--hidden-dim", type=int, default=512, help="Hidden dimension")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+    parser.add_argument("--unfreeze-clip", action="store_true", help="Unfreeze CLIP for fine-tuning")
+    parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--save-every-n-epochs", type=int, default=2, help="Save every N epochs")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Steps for gradient accumulation")
     
     args = parser.parse_args()
+    
+    # Create configs from args
+    model_config = ModelConfig(
+        model_name=args.model_name,
+        num_answers=args.num_answers,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+        unfreeze_clip=args.unfreeze_clip
+    )
+    
+    train_config = TrainingConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        data_fraction=args.data_fraction,
+        save_path=args.save_path,
+        vocab_path=args.vocab_path,
+        weight_decay=args.weight_decay,
+        save_every_n_epochs=args.save_every_n_epochs,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
+    )
     
     # Create models directory
     Path("models").mkdir(exist_ok=True)
     
     # Train model
     trained_model = train(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        data_fraction=args.data_fraction,
-        save_path=args.save_path,
-        vocab_path=args.vocab_path
+        model_config=model_config,
+        train_config=train_config
     )
     
     logger.info("Training completed!")

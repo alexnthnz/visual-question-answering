@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from .model import VQAModel
 from .data import _DATA_DIR
+from .config import EvaluationConfig
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -87,15 +88,12 @@ def analyze_by_question_type(
 
 
 def evaluate(
-    model_path: Optional[str] = None,
-    vocab_path: Optional[str] = None,
-    data_fraction: float = 0.1,
-    batch_size: int = 32
+    eval_config: EvaluationConfig = EvaluationConfig()
 ) -> Dict[str, float]:
     """Evaluate the VQA model with proper metrics."""
     
     logger.info("Loading dataset...")
-    val_split = f"validation[:{int(data_fraction * 100)}%]"
+    val_split = f"validation[:{int(eval_config.data_fraction * 100)}%]"
     dataset = load_dataset("vqa", "vqa_v2", data_dir=str(_DATA_DIR), split=val_split)
     
     # Initialize model
@@ -103,14 +101,14 @@ def evaluate(
     model = VQAModel()
     
     # Load model weights if provided
-    if model_path and Path(model_path).exists():
-        logger.info(f"Loading model from {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    if eval_config.model_path and Path(eval_config.model_path).exists():
+        logger.info(f"Loading model from {eval_config.model_path}")
+        model.load_state_dict(torch.load(eval_config.model_path, map_location='cpu'))
     
     # Load vocabulary
-    if vocab_path and Path(vocab_path).exists():
-        logger.info(f"Loading vocabulary from {vocab_path}")
-        model.load_answer_vocab(vocab_path)
+    if eval_config.vocab_path and Path(eval_config.vocab_path).exists():
+        logger.info(f"Loading vocabulary from {eval_config.vocab_path}")
+        model.load_answer_vocab(eval_config.vocab_path)
     else:
         logger.info("Building vocabulary from validation set...")
         model.build_answer_vocab(dataset)
@@ -128,8 +126,8 @@ def evaluate(
     questions = []
     
     # Process in batches for efficiency
-    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
-        batch_end = min(i + batch_size, len(dataset))
+    for i in tqdm(range(0, len(dataset), eval_config.batch_size), desc="Evaluating"):
+        batch_end = min(i + eval_config.batch_size, len(dataset))
         batch = dataset[i:batch_end]
         
         # Prepare batch data
@@ -215,13 +213,16 @@ def main():
     
     args = parser.parse_args()
     
-    # Run evaluation
-    results = evaluate(
-        model_path=args.model_path,
-        vocab_path=args.vocab_path,
+    # Create config from args
+    eval_config = EvaluationConfig(
+        batch_size=args.batch_size,
         data_fraction=args.data_fraction,
-        batch_size=args.batch_size
+        model_path=args.model_path,
+        vocab_path=args.vocab_path
     )
+    
+    # Run evaluation
+    results = evaluate(eval_config)
     
     # Print results
     print_results(results)
@@ -230,7 +231,6 @@ def main():
     results_path = Path("evaluation_results.json")
     import json
     with open(results_path, 'w') as f:
-        # Convert non-serializable items
         serializable_results = {
             'overall_accuracy': results['overall_accuracy'],
             'question_type_accuracies': results['question_type_accuracies'],

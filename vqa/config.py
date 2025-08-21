@@ -13,6 +13,7 @@ class ModelConfig:
     num_answers: int = 3000
     hidden_dim: int = 512
     dropout: float = 0.1
+    unfreeze_clip: bool = False
 
 
 @dataclass
@@ -25,6 +26,7 @@ class TrainingConfig:
     weight_decay: float = 0.01
     data_fraction: float = 0.1
     save_every_n_epochs: int = 2
+    gradient_accumulation_steps: int = 1
     
     # Paths
     save_path: str = "models/vqa_model"
