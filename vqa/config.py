@@ -9,11 +9,18 @@ from typing import Optional
 class ModelConfig:
     """Configuration for VQA model architecture."""
     
-    model_name: str = "openai/clip-vit-base-patch32"
+    model_name: str = "openai/clip-vit-large-patch14"  # Upgraded to larger backbone for improved performance
     num_answers: int = 3000
     hidden_dim: int = 512
     dropout: float = 0.1
     unfreeze_clip: bool = False
+    fusion_type: str = "concat"  # Options: 'concat', 'cross_attention'
+    num_fusion_layers: int = 2
+    num_attention_heads: int = 8
+    use_lora: bool = False
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.1
 
 
 @dataclass
@@ -27,6 +34,7 @@ class TrainingConfig:
     data_fraction: float = 0.1
     save_every_n_epochs: int = 2
     gradient_accumulation_steps: int = 1
+    staged_unfreeze_epoch: int = 0  # Epoch to unfreeze CLIP (0 means never, unless unfreeze_clip=True from start)
     
     # Paths
     save_path: str = "models/vqa_model"

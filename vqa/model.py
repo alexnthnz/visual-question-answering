@@ -4,6 +4,9 @@ import torch.nn as nn
 from transformers import CLIPModel, CLIPProcessor
 from pathlib import Path
 import json
+import torch.nn.functional as F
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from peft import LoraConfig, get_peft_model
 
 
 class VQAModel(nn.Module):
@@ -15,7 +18,14 @@ class VQAModel(nn.Module):
         num_answers: int = 3000,
         hidden_dim: int = 512,
         dropout: float = 0.1,
-        unfreeze_clip: bool = False
+        unfreeze_clip: bool = False,
+        fusion_type: str = "concat",
+        num_fusion_layers: int = 2,
+        num_attention_heads: int = 8,
+        use_lora: bool = False,
+        lora_rank: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.1
     ) -> None:
         super().__init__()
         
@@ -23,12 +33,42 @@ class VQAModel(nn.Module):
         self.processor = CLIPProcessor.from_pretrained(model_name)
         self.clip_model = CLIPModel.from_pretrained(model_name)
         
+        # Apply LoRA if enabled
+        self.use_lora = use_lora
+        if use_lora:
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # Target attention layers in CLIP
+                lora_dropout=lora_dropout,
+                bias="none"
+            )
+            self.clip_model = get_peft_model(self.clip_model, lora_config)
+            # Print trainable params for verification
+            self.clip_model.print_trainable_parameters()
+        
         # Get CLIP embedding dimension
         clip_dim = self.clip_model.config.projection_dim
         
-        # Answer classification head
+        self.fusion_type = fusion_type
+        
+        if fusion_type == "cross_attention":
+            # Cross-attention fusion using Transformer
+            encoder_layer = TransformerEncoderLayer(
+                d_model=clip_dim,
+                nhead=num_attention_heads,
+                dim_feedforward=hidden_dim,
+                dropout=dropout,
+                activation="relu"
+            )
+            self.fusion_encoder = TransformerEncoder(encoder_layer, num_layers=num_fusion_layers)
+        else:
+            self.fusion_encoder = None
+        
+        # Answer classification head (input size depends on fusion)
+        classifier_input_dim = clip_dim if fusion_type == "cross_attention" else clip_dim * 2
         self.classifier = nn.Sequential(
-            nn.Linear(clip_dim * 2, hidden_dim),  # Concat image + text features
+            nn.Linear(classifier_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
@@ -41,9 +81,10 @@ class VQAModel(nn.Module):
         self.answer_vocab: Optional[Dict[str, int]] = None
         self.idx_to_answer: Optional[Dict[int, str]] = None
         
-        # Handle CLIP freezing
-        for param in self.clip_model.parameters():
-            param.requires_grad = unfreeze_clip
+        # Handle CLIP freezing (for non-LoRA case)
+        if not use_lora:
+            for param in self.clip_model.parameters():
+                param.requires_grad = unfreeze_clip
     
     def build_answer_vocab(self, dataset) -> Dict[str, int]:
         """Build answer vocabulary from dataset."""
@@ -132,18 +173,36 @@ class VQAModel(nn.Module):
         device = next(self.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # Get CLIP embeddings
-        clip_outputs = self.clip_model(**inputs)
+        # Get CLIP embeddings - use last_hidden_state for finer features
+        clip_outputs = self.clip_model(**inputs, output_hidden_states=True)
         
-        # Extract normalized features
-        image_features = clip_outputs.image_embeds  # [batch_size, clip_dim]
-        text_features = clip_outputs.text_embeds    # [batch_size, clip_dim]
+        # Extract features (use last hidden state for text and vision)
+        # For vision: [batch, num_patches + 1, dim] (including CLS)
+        # For text: [batch, seq_len, dim]
+        image_features = clip_outputs.vision_model_output.last_hidden_state  # [batch, patches+1, dim]
+        text_features = clip_outputs.text_model_output.last_hidden_state     # [batch, seq_len, dim]
         
-        # Concatenate features
-        combined_features = torch.cat([image_features, text_features], dim=1)
+        if self.fusion_type == "cross_attention":
+            # Prepare for cross-attention: treat text as query, image as key/value
+            # Average text features to get a single vector per batch item
+            text_query = text_features.mean(dim=1).unsqueeze(1)  # [batch, 1, dim]
+            
+            # Concatenate text query with image features
+            combined = torch.cat([text_query, image_features], dim=1)  # [batch, 1 + patches+1, dim]
+            
+            # Apply fusion encoder
+            fused_features = self.fusion_encoder(combined)  # [batch, seq_len, dim]
+            
+            # Pool the fused features (global average pooling)
+            pooled_features = fused_features.mean(dim=1)  # [batch, dim]
+        else:
+            # Original concat method using pooled embeds
+            image_pooled = clip_outputs.image_embeds
+            text_pooled = clip_outputs.text_embeds
+            pooled_features = torch.cat([image_pooled, text_pooled], dim=1)
         
         # Classify answers
-        logits = self.classifier(combined_features)
+        logits = self.classifier(pooled_features)
         
         return logits
     
@@ -173,6 +232,10 @@ class VQAModel(nn.Module):
         return predictions
     
     def unfreeze_clip(self) -> None:
-        """Unfreeze CLIP parameters for fine-tuning."""
+        """Unfreeze CLIP parameters for fine-tuning. If using LoRA, this enables full fine-tuning post-LoRA."""
+        if self.use_lora:
+            # Merge LoRA adapters and unfreeze
+            self.clip_model = self.clip_model.merge_and_unload()
+            self.use_lora = False  # Disable LoRA after merging
         for param in self.clip_model.parameters():
             param.requires_grad = True

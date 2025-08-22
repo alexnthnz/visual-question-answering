@@ -119,6 +119,11 @@ def train(
     progress_bar = tqdm(total=total_steps, desc="Training")
     
     for epoch in range(train_config.epochs):
+        # Check for staged unfreezing
+        if train_config.staged_unfreeze_epoch > 0 and (epoch + 1) == train_config.staged_unfreeze_epoch:
+            logger.info(f"Unfreezing CLIP at epoch {epoch + 1}")
+            model.unfreeze_clip()
+        
         epoch_loss = 0.0
         num_batches = 0
         accumulated_loss = 0.0
@@ -187,6 +192,11 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=512, help="Hidden dimension")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--unfreeze-clip", action="store_true", help="Unfreeze CLIP for fine-tuning")
+    parser.add_argument("--use-lora", action="store_true", help="Use LoRA for efficient fine-tuning")
+    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora-dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--staged-unfreeze-epoch", type=int, default=0, help="Epoch to unfreeze CLIP (for staged fine-tuning)")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--save-every-n-epochs", type=int, default=2, help="Save every N epochs")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Steps for gradient accumulation")
@@ -199,7 +209,11 @@ def main():
         num_answers=args.num_answers,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-        unfreeze_clip=args.unfreeze_clip
+        unfreeze_clip=args.unfreeze_clip,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout
     )
     
     train_config = TrainingConfig(
@@ -211,7 +225,8 @@ def main():
         vocab_path=args.vocab_path,
         weight_decay=args.weight_decay,
         save_every_n_epochs=args.save_every_n_epochs,
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        staged_unfreeze_epoch=args.staged_unfreeze_epoch
     )
     
     # Create models directory
